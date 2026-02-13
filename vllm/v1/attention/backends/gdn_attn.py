@@ -2,11 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
+import time
 from dataclasses import dataclass
 
 import torch
 
 from vllm.config import VllmConfig
+
+# Profiling flag - set VLLM_GDN_PROFILE=1 to enable
+_GDN_PROFILE = os.environ.get("VLLM_GDN_PROFILE", "0") == "1"
+
+
+def _sync_and_time(label: str, start_time: float) -> float:
+    """Synchronize CUDA and print timing if profiling is enabled."""
+    if _GDN_PROFILE:
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start_time) * 1000
+        print(f"[GDN_PROFILE] {label}: {elapsed:.3f} ms")
+    return time.perf_counter()
+
+
+def _mark_checkpoint(label: str) -> float:
+    """Mark a checkpoint without sync (just record time)."""
+    if _GDN_PROFILE:
+        print(f"[GDN_PROFILE] >>> {label}")
+    return time.perf_counter()
+
+
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -153,20 +176,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
+        _t0 = _mark_checkpoint("build() start")
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        _t0 = _sync_and_time("after compute_num_computed_tokens", _t0)
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
             m.seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
+        _t0 = _sync_and_time("after mamba_get_block_table_tensor", _t0)
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        _t0 = _mark_checkpoint("spec_decode check")
         if (
             not self.use_spec_decode
             or num_decode_draft_tokens_cpu is None
@@ -187,11 +214,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = spec_sequence_masks_cpu.to(
                     query_start_loc.device, non_blocking=True
                 )
+        _t0 = _sync_and_time("after spec_decode check (.item() calls)", _t0)
 
         if spec_sequence_masks is None:
+            _t0 = _mark_checkpoint("split_decodes_and_prefills (no spec)")
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(m, decode_threshold=1)
             )
+            _t0 = _sync_and_time("after split_decodes_and_prefills", _t0)
             num_spec_decode_tokens = 0
             spec_token_indx = None
             non_spec_token_indx = None
@@ -202,6 +232,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
         else:
+            _t0 = _mark_checkpoint("spec decode branch")
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
@@ -219,8 +250,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decode_tokens = (
                 query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
             )
+            _t0 = _sync_and_time("after num calcs (CPU .item() calls)", _t0)
 
             if num_prefills == 0 and num_decodes == 0:
+                _t0 = _mark_checkpoint("pure spec decode path")
                 spec_token_size = min(
                     num_spec_decodes * (self.num_spec + 1),
                     query_start_loc_cpu[-1].item(),
@@ -244,11 +277,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
+                _t0 = _sync_and_time("after pure spec decode setup", _t0)
             else:
+                _t0 = _mark_checkpoint("mixed spec/non-spec path")
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks, query_lens
                 )
+                _t0 = _sync_and_time("after repeat_interleave", _t0)
                 index = torch.argsort(spec_token_masks, stable=True)
+                _t0 = _sync_and_time("after argsort (POTENTIAL SYNC!)", _t0)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
@@ -259,6 +296,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_state_indices_tensor = block_table_tensor[
                     ~spec_sequence_masks, 0
                 ]
+                _t0 = _sync_and_time("after block_table indexing", _t0)
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,
@@ -278,6 +316,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     dim=0,
                     out=non_spec_query_start_loc[1:],
                 )
+                _t0 = _sync_and_time("after GPU cumsum ops", _t0)
                 non_spec_query_start_loc_cpu = torch.zeros(
                     query_lens_cpu.size(0) - num_spec_decodes + 1,
                     dtype=torch.int32,
@@ -291,6 +330,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks]
 
+        _t0 = _mark_checkpoint("prefill setup")
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks is not None:
@@ -302,6 +342,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
             )
+            _t0 = _sync_and_time("after compute_causal_conv1d_metadata", _t0)
         else:
             has_initial_state = None
 
@@ -314,6 +355,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # Prepare tensors for cudagraph
         # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
         batch_size = m.num_actual_tokens
+        _t0 = _mark_checkpoint("cudagraph tensor prep")
 
         if (
             self.use_full_cuda_graph
@@ -359,6 +401,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
+            _t0 = _sync_and_time("after spec cudagraph tensor prep", _t0)
 
         if (
             self.use_full_cuda_graph
@@ -380,7 +423,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+            _t0 = _sync_and_time("after non-spec cudagraph tensor prep", _t0)
 
+        _t0 = _sync_and_time("build() complete", _t0)
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -411,6 +456,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         This method builds the metadata for full cudagraph capture.
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
+        _t0 = _mark_checkpoint("build_for_cudagraph_capture() start")
         m = common_attn_metadata
 
         assert (
@@ -425,6 +471,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
+        _t0 = _sync_and_time("after torch.diff", _t0)
+        # WARNING: This .cpu() call causes CPU-GPU synchronization!
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
+        _t0 = _sync_and_time("after .cpu() (SYNC POINT!)", _t0)
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)

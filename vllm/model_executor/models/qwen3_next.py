@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
+import time
 from collections.abc import Iterable
 from itertools import islice
 
@@ -9,6 +11,27 @@ import torch
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
+
+# Profiling flag - set VLLM_GDN_PROFILE=1 to enable
+_GDN_PROFILE = os.environ.get("VLLM_GDN_PROFILE", "0") == "1"
+_GDN_PROFILE_LAYER = int(os.environ.get("VLLM_GDN_PROFILE_LAYER", "0"))
+
+
+def _gdn_sync_and_time(label: str, start_time: float, layer_idx: int = 0) -> float:
+    """Synchronize CUDA and print timing if profiling is enabled."""
+    if _GDN_PROFILE and layer_idx == _GDN_PROFILE_LAYER:
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start_time) * 1000
+        print(f"[GDN_MODEL_PROFILE L{layer_idx}] {label}: {elapsed:.3f} ms")
+    return time.perf_counter()
+
+
+def _gdn_mark_checkpoint(label: str, layer_idx: int = 0) -> float:
+    """Mark a checkpoint without sync (just record time)."""
+    if _GDN_PROFILE and layer_idx == _GDN_PROFILE_LAYER:
+        print(f"[GDN_MODEL_PROFILE L{layer_idx}] >>> {label}")
+    return time.perf_counter()
+
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -621,6 +644,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         """
         Core attention computation (called by custom op).
         """
+        _t0 = _gdn_mark_checkpoint("_forward_core start", self.layer_idx)
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
@@ -644,6 +668,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        _t0 = _gdn_sync_and_time("after metadata setup", _t0, self.layer_idx)
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -654,6 +679,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
+        _t0 = _gdn_mark_checkpoint("index_select start", self.layer_idx)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -664,9 +690,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+        _t0 = _gdn_sync_and_time("after index_select", _t0, self.layer_idx)
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            _t0 = _gdn_mark_checkpoint("spec conv1d_update start", self.layer_idx)
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -681,9 +709,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
+            _t0 = _gdn_sync_and_time("after spec conv1d_update", _t0, self.layer_idx)
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
+            _t0 = _gdn_mark_checkpoint("prefill conv1d_fn start", self.layer_idx)
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
@@ -698,7 +728,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
             ).transpose(0, 1)
+            _t0 = _gdn_sync_and_time("after prefill conv1d_fn", _t0, self.layer_idx)
         elif attn_metadata.num_decodes > 0:
+            _t0 = _gdn_mark_checkpoint("decode conv1d_update start", self.layer_idx)
             mixed_qkv_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
                 conv_state,
@@ -710,15 +742,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 ],
                 validate_data=True,
             )
+            _t0 = _gdn_sync_and_time("after decode conv1d_update", _t0, self.layer_idx)
         else:
             mixed_qkv_non_spec = None
 
+        _t0 = _gdn_mark_checkpoint("rearrange_mixed_qkv start", self.layer_idx)
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec
         )
+        _t0 = _gdn_sync_and_time("after rearrange_mixed_qkv", _t0, self.layer_idx)
 
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        _t0 = _gdn_sync_and_time("after fused_gdn_gating", _t0, self.layer_idx)
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -736,11 +772,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             beta_spec = None
             g_non_spec = g
             beta_non_spec = beta
+        _t0 = _gdn_sync_and_time("after g/beta index_select", _t0, self.layer_idx)
 
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            _t0 = _gdn_mark_checkpoint("spec recurrent start", self.layer_idx)
             core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
                 q=query_spec,
                 k=key_spec,
@@ -754,11 +792,15 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 num_accepted_tokens=num_accepted_tokens,
                 use_qk_l2norm_in_kernel=True,
             )
+            _t0 = _gdn_sync_and_time("after spec recurrent", _t0, self.layer_idx)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
+            _t0 = _gdn_mark_checkpoint(
+                "prefill chunk_gated_delta_rule start", self.layer_idx
+            )
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
@@ -780,7 +822,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            _t0 = _gdn_sync_and_time(
+                "after prefill chunk_gated_delta_rule", _t0, self.layer_idx
+            )
         elif attn_metadata.num_decodes > 0:
+            _t0 = _gdn_mark_checkpoint("decode recurrent start", self.layer_idx)
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_recurrent_gated_delta_rule(
                     q=query_non_spec,
@@ -797,10 +843,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     use_qk_l2norm_in_kernel=True,
                 )
             )
+            _t0 = _gdn_sync_and_time("after decode recurrent", _t0, self.layer_idx)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
         # 3. Merge core attention output
+        _t0 = _gdn_mark_checkpoint("merge output start", self.layer_idx)
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
@@ -814,6 +862,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+        _t0 = _gdn_sync_and_time("_forward_core complete", _t0, self.layer_idx)
 
 
 class Qwen3NextAttention(nn.Module):
